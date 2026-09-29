@@ -1,4 +1,4 @@
-import { createDecipheriv, createHash } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
 const ENCRYPTED_PREFIX = "enc:v1:";
 const KEY_ENV = "CONFIG_ENCRYPTION_KEY";

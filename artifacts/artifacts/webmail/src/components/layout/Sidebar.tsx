@@ -56,9 +56,12 @@ export default function Sidebar({ onCompose, onClose }: SidebarProps) {
 
   useEffect(() => {
     fetch(apiUrl("/api/tokens/emails"), { credentials: "include" })
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
       .then((data: { emails: string[] }) => setEmails(data.emails ?? []))
-      .catch(() => {});
+      .catch((err) => console.error("[UI] Failed to load personal inboxes:", err));
   }, []);
 
   const getUnread = (folder: string) => {
@@ -66,7 +69,8 @@ export default function Sidebar({ onCompose, onClose }: SidebarProps) {
     return f?.unreadCount ?? 0;
   };
 
-  const isPersonalInboxActive = (email: string) => location === `/inbox/${encodeURIComponent(email)}`;
+  const isPersonalInboxActive = (email: string) =>
+    location === `/inbox/${encodeURIComponent(email)}` || location === `/inbox/${email}`;
 
   return (
     <div className="flex flex-col h-full bg-sidebar text-sidebar-foreground select-none">

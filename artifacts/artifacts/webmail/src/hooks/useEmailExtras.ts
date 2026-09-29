@@ -11,14 +11,31 @@ export interface Attachment {
   name: string;
   contentType: string;
   size: number;
+  isInline?: boolean;
+  contentId?: string | null;
 }
 
-export function useAttachments(messageId: string, enabled: boolean) {
+function withUpn(path: string, upn?: string, extra?: Record<string, string>): string {
+  const qs = new URLSearchParams({ ...(upn ? { upn } : {}), ...(extra ?? {}) }).toString();
+  return apiUrl(qs ? `${path}?${qs}` : path);
+}
+
+/** URL an <img> can load directly (same-origin, session cookie is sent). */
+export function attachmentUrl(messageId: string, attachmentId: string, upn?: string, inline = false): string {
+  return withUpn(
+    `/api/email/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    upn,
+    inline ? { inline: "1" } : undefined,
+  );
+}
+
+export function useAttachments(messageId: string, enabled: boolean, upn?: string) {
   return useQuery<Attachment[]>({
-    queryKey: ["attachments", messageId],
+    queryKey: ["attachments", messageId, upn ?? null],
     queryFn: async () => {
-      const res = await fetch(apiUrl(`/api/email/messages/${messageId}/attachments`), {
+      const res = await fetch(withUpn(`/api/email/messages/${encodeURIComponent(messageId)}/attachments`, upn), {
         headers: authHeaders(),
+        credentials: "include",
       });
       if (!res.ok) throw new Error("Failed to fetch attachments");
       const data = (await res.json()) as { attachments: Attachment[] };
@@ -57,9 +74,10 @@ export function downloadAttachment(
   attachmentId: string,
   name: string,
   onError: () => void,
+  upn?: string,
 ): void {
-  const url = apiUrl(`/api/email/messages/${messageId}/attachments/${attachmentId}`);
-  fetch(url)
+  const url = attachmentUrl(messageId, attachmentId, upn);
+  fetch(url, { credentials: "include" })
     .then((r) => {
       if (!r.ok) throw new Error("Download failed");
       return r.blob();

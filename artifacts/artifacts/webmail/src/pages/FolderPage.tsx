@@ -90,7 +90,15 @@ export default function FolderPage({ folder, title, upn }: FolderPageProps) {
 
   useEffect(() => {
     if (error) {
-      toast({ title: "Failed to load messages", description: "Check your connection and token status", variant: "destructive" });
+      const status = (error as { status?: number }).status;
+      toast({
+        title: "Failed to load messages",
+        description:
+          status === 401
+            ? `No usable token${upn ? ` for ${upn}` : ""}. Re-provision it in the admin panel.`
+            : (error as Error).message,
+        variant: "destructive",
+      });
     }
   }, [error]);
 
@@ -100,7 +108,7 @@ export default function FolderPage({ folder, title, upn }: FolderPageProps) {
     setSearchInput("");
     setActiveTab("messages");
     setPage(0);
-  }, [folder]);
+  }, [folder, upn]);
 
   const invalidateList = () => {
     qc.invalidateQueries({ queryKey: getListMessagesQueryKey(params) });
@@ -503,6 +511,7 @@ export default function FolderPage({ folder, title, upn }: FolderPageProps) {
             <ReadingPane
               messageId={selectedMsg.id}
               currentFolder={folder}
+              upn={upn}
               onClose={() => setSelectedMsg(null)}
               onToggleStar={() => handleToggleStar(selectedMsg)}
               onDelete={handleDelete}

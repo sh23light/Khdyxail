@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, Component, type ReactNode } from "react";
 import {
   useGetMessage,
   useMarkMessageRead,
@@ -15,13 +15,15 @@ import {
 } from "lucide-react";
 import { format, parseISO, isToday, isThisYear } from "date-fns";
 import ComposeModal from "./ComposeModal";
-import { useAttachments, downloadAttachment } from "@/hooks/useEmailExtras";
+import { useAttachments, downloadAttachment, attachmentUrl, type Attachment } from "@/hooks/useEmailExtras";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 
 interface ReadingPaneProps {
   messageId: string;
   currentFolder: string;
+  /** Mailbox that owns the message (personal inbox view). Omitted in the unified inbox. */
+  upn?: string;
   onClose: () => void;
   onToggleStar?: () => void;
   onDelete?: () => void;
@@ -63,6 +65,15 @@ function formatDate(dateStr: string | null | undefined): string {
   }
 }
 
+function describeError(error: unknown): string {
+  const status = (error as { status?: number } | null)?.status;
+  if (status === 401) return "The mailbox token is expired or was rejected. Re-provision it in the admin panel.";
+  if (status === 403) return "The mailbox token lacks permission to read this message.";
+  if (status === 404) return "Message not found in any connected mailbox. It may have been moved or deleted.";
+  if (status === 504) return "Microsoft did not respond in time. Try again.";
+  return (error as Error | null)?.message ?? "Unknown error";
+}
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -82,6 +93,38 @@ function processEmailHtml(html: string): string {
   return html
     .replace(/<a\s/gi, '<a target="_blank" rel="noopener noreferrer" ')
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
+}
+
+const CID_REF = /(["'(])cid:([^"')\s>]+)/gi;
+
+function hasCidRefs(html: string | null | undefined): boolean {
+  return !!html && /cid:/i.test(html);
+}
+
+/**
+ * Outlook embeds pictures as inline attachments referenced by `cid:<contentId>`.
+ * Browsers can't load `cid:` URLs, so point each one at the attachment endpoint.
+ * The URL is made absolute because the iframe document is `about:srcdoc`.
+ */
+function resolveInlineImages(
+  html: string,
+  attachments: Attachment[] | undefined,
+  messageId: string,
+  upn?: string,
+): string {
+  if (!attachments?.length || !hasCidRefs(html)) return html;
+  const byCid = new Map<string, string>();
+  for (const a of attachments) {
+    const cid = a.contentId?.replace(/^<|>$/g, "").trim().toLowerCase();
+    if (!cid) continue;
+    byCid.set(cid, new URL(attachmentUrl(messageId, a.id, upn, true), window.location.href).href);
+  }
+  return html.replace(CID_REF, (match, quote: string, rawCid: string) => {
+    let cid = rawCid;
+    try { cid = decodeURIComponent(rawCid); } catch { /* keep raw */ }
+    const url = byCid.get(cid.trim().toLowerCase());
+    return url ? `${quote}${url}` : match;
+  });
 }
 
 // ── Email iframe body ─────────────────────────────────────────────────────────
@@ -130,9 +173,46 @@ function EmailIframe({ html }: { html: string }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function ReadingPane({
+export default function ReadingPane(props: ReadingPaneProps) {
+  // Keyed by message so one bad message doesn't keep the boundary in error state.
+  return (
+    <ReadingPaneBoundary key={props.messageId} onClose={props.onClose}>
+      <ReadingPaneInner {...props} />
+    </ReadingPaneBoundary>
+  );
+}
+
+class ReadingPaneBoundary extends Component<
+  { children: ReactNode; onClose: () => void },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error("[UI] ReadingPane crashed:", error);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground gap-3 p-8">
+        <AlertCircle className="w-8 h-8 text-destructive" />
+        <p className="text-sm">This message could not be displayed</p>
+        <p className="text-xs max-w-sm text-center break-words">{this.state.error.message}</p>
+        <Button variant="outline" size="sm" onClick={this.props.onClose}>Close</Button>
+      </div>
+    );
+  }
+}
+
+function ReadingPaneInner({
   messageId,
   currentFolder,
+  upn,
   onClose,
   onToggleStar,
   onDelete,
@@ -144,22 +224,34 @@ export default function ReadingPane({
   const [forwardOpen, setForwardOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
 
-  const { data: msg, isLoading, error } = useGetMessage(messageId, {
-    query: { queryKey: getGetMessageQueryKey(messageId) },
+  const { data: msg, isLoading, error, refetch } = useGetMessage(messageId, {
+    query: { queryKey: getGetMessageQueryKey(messageId), retry: 1 },
   });
 
   useEffect(() => {
     if (error) {
-      toast({ title: "Failed to load message", description: "Could not read email content", variant: "destructive" });
+      toast({ title: "Failed to load message", description: describeError(error), variant: "destructive" });
     }
   }, [error]);
 
   const markRead = useMarkMessageRead();
   const extMsg = msg as typeof msg & { isFlagged?: boolean };
 
+  // Graph reports hasAttachments=false when a message only has inline images,
+  // so also fetch the list whenever the body references cid: images.
+  const needsAttachments = !!msg?.hasAttachments || hasCidRefs(msg?.body);
   const { data: attachments, isLoading: attachmentsLoading } = useAttachments(
     messageId,
-    !!(msg?.hasAttachments)
+    needsAttachments,
+    upn,
+  );
+  const fileAttachments = useMemo(
+    () => (attachments ?? []).filter((a) => !a.isInline),
+    [attachments],
+  );
+  const bodyHtml = useMemo(
+    () => (msg?.body ? resolveInlineImages(msg.body, attachments, messageId, upn) : null),
+    [msg?.body, attachments, messageId, upn],
   );
 
   const handleToggleRead = () => {
@@ -215,7 +307,11 @@ export default function ReadingPane({
       <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground gap-3 p-8">
         <AlertCircle className="w-8 h-8 text-destructive" />
         <p className="text-sm">Failed to load message</p>
-        <p className="text-xs">Connection or token issue</p>
+        <p className="text-xs max-w-sm text-center">{describeError(error)}</p>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>
+          <Button variant="ghost" size="sm" onClick={onClose}>Close</Button>
+        </div>
       </div>
     );
   }
@@ -392,13 +488,14 @@ export default function ReadingPane({
                 <Skeleton className="h-9 w-36 rounded-lg" />
                 <Skeleton className="h-9 w-28 rounded-lg" />
               </div>
-            ) : attachments && attachments.length > 0 ? (
+            ) : fileAttachments.length > 0 ? (
               <div className="flex flex-wrap gap-2">
-                {attachments.map((att) => (
+                {fileAttachments.map((att) => (
                   <button
                     key={att.id}
                     onClick={() => downloadAttachment(messageId, att.id, att.name, () =>
-                      toast({ title: "Download failed", variant: "destructive" })
+                      toast({ title: "Download failed", variant: "destructive" }),
+                      upn,
                     )}
                     className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-background hover:bg-accent transition-colors text-xs group"
                     title={`Download ${att.name} (${formatFileSize(att.size)})`}
@@ -421,8 +518,8 @@ export default function ReadingPane({
 
         {/* Email body */}
         <div className="px-8 py-6">
-          {msg.body ? (
-            <EmailIframe html={msg.body} />
+          {bodyHtml ? (
+            <EmailIframe html={bodyHtml} />
           ) : msg.bodyPreview ? (
             <p className="text-sm text-foreground leading-relaxed whitespace-pre-wrap">{msg.bodyPreview}</p>
           ) : (

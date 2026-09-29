@@ -1,5 +1,18 @@
+import dns from "node:dns";
+import net from "node:net";
 import app from "./app";
 import { logger } from "./lib/logger";
+
+// graph.microsoft.com / outlook.office365.com resolve to both IPv4 and IPv6.
+// Hosts without working outbound IPv6 (this machine, Railway containers) make
+// Node's dual-stack "happy eyeballs" connect fail intermittently with
+// ETIMEDOUT ("fetch failed"), which surfaced as empty mailboxes and
+// "load error" in the reading pane. Connect over IPv4 only.
+// Set PREFER_IPV6=1 to restore Node's default behaviour.
+if (process.env["PREFER_IPV6"] !== "1") {
+  dns.setDefaultResultOrder("ipv4first");
+  net.setDefaultAutoSelectFamily(false);
+}
 
 const rawPort = process.env["PORT"];
 

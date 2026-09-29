@@ -36,19 +36,52 @@ const FOLDER_MAP: Record<string, string> = {
   junkemail: "junkemail",
 };
 
+type UpstreamError = { status?: number; message?: string; body?: string };
+
+/**
+ * Message IDs belong to exactly one mailbox. When the caller doesn't know which
+ * mailbox (unified inbox) or the token set holds several, run the call against
+ * every token and return the first success. Only the owning mailbox can
+ * succeed; the others fail with 404, which we ignore.
+ *
+ * If every token fails, the error rethrown is the most useful one: an auth or
+ * timeout failure (401/403/5xx) is preferred over "not found", so the UI shows
+ * the real cause instead of a generic "Message not found".
+ */
 async function tryEachToken<T>(
   tokens: TokenWithBase[],
+  label: string,
   fn: (token: string, baseUrl: string) => Promise<T>,
-): Promise<T | null> {
-  if (tokens.length === 0) return null;
-  if (tokens.length === 1) {
-    try { return await fn(tokens[0].token, tokens[0].baseUrl); } catch { return null; }
+): Promise<T> {
+  if (tokens.length === 0) {
+    throw Object.assign(new Error("No access token"), { status: 401 });
   }
-  const results = await Promise.allSettled(tokens.map(t => fn(t.token, t.baseUrl)));
+  const results = await Promise.allSettled(tokens.map((t) => fn(t.token, t.baseUrl)));
+  const errors: UpstreamError[] = [];
   for (const r of results) {
     if (r.status === "fulfilled") return r.value;
+    errors.push((r.reason ?? {}) as UpstreamError);
   }
-  return null;
+  const pick =
+    errors.find((e) => e.status && e.status !== 404 && e.status !== 400) ??
+    errors[0] ??
+    {};
+  console.error(
+    `[Graph] ${label} failed on all ${tokens.length} token(s):`,
+    errors.map((e) => `${e.status ?? "?"} ${(e.body ?? e.message ?? "").slice(0, 200)}`).join(" | "),
+  );
+  throw Object.assign(new Error(pick.message ?? "Upstream request failed"), {
+    status: pick.status ?? 502,
+    body: pick.body,
+  });
+}
+
+/** Per-message routes. The frontend client calls /email/messages/:id; /email/me/:id is kept as an alias. */
+const msgRoute = (suffix = "") => [`/email/messages/:id${suffix}`, `/email/me/:id${suffix}`];
+
+function upnOf(req: Request): string | undefined {
+  const upn = req.query.upn;
+  return typeof upn === "string" && upn.length > 0 ? upn : undefined;
 }
 
 async function graphGet(
@@ -181,17 +214,27 @@ router.get("/email/messages", async (req: Request, res: Response) => {
     }
     if (filter) params["$filter"] = filter;
 
+    const failures: UpstreamError[] = [];
     const results = await Promise.all(
       tokens.map(async (twb) => {
         try {
           const data = await graphGet(twb.token, twb.baseUrl, `/me/mailFolders/${graphFolder}/messages`, params, { "ConsistencyLevel": "eventual" }) as Record<string, unknown>;
           return (data.value as Array<Record<string, unknown>> ?? []).map((m) => mapMessage(m, folder));
         } catch (err) {
-          console.error(`[API] listMessages failed:`, (err as Error).message, (err as {body?:string}).body ?? "");
+          const e = err as UpstreamError;
+          failures.push(e);
+          console.error(`[Graph] listMessages failed for ${twb.user}:`, e.status ?? "", e.message, (e.body ?? "").slice(0, 300));
           return [];
         }
       })
     );
+
+    // Every mailbox failed: report it instead of a misleading empty inbox.
+    if (failures.length === tokens.length) {
+      const pick = failures.find((f) => f.status && f.status !== 404) ?? failures[0]!;
+      res.status(pick.status ?? 502).json({ error: pick.message ?? "Mailbox request failed" });
+      return;
+    }
 
     const messages = results.flat().sort((a, b) => {
       if (!a.receivedDateTime) return 1;
@@ -206,134 +249,133 @@ router.get("/email/messages", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/email/me/:id", async (req: Request, res: Response) => {
-  const tokens = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (tokens.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-
+router.get(msgRoute(), async (req: Request, res: Response) => {
   const parsed = GetMessageParams.safeParse(req.params);
   if (!parsed.success) { res.status(400).json({ error: "Invalid params" }); return; }
 
-  const result = await tryEachToken(tokens, (token, baseUrl) =>
-    graphGet(token, baseUrl, `/me/messages/${parsed.data.id}`, {
-      "$select": `${MESSAGE_SELECT},body`,
-    }) as Promise<Record<string, unknown>>
-  );
-  if (!result) { res.status(404).json({ error: "Message not found" }); return; }
-  res.json(mapMessage(result));
+  try {
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const result = await tryEachToken(tokens, "getMessage", (token, baseUrl) =>
+      graphGet(token, baseUrl, `/me/messages/${encodeURIComponent(parsed.data.id)}`, {
+        "$select": `${MESSAGE_SELECT},body`,
+      }) as Promise<Record<string, unknown>>
+    );
+    res.json(mapMessage(result));
+  } catch (err) {
+    handleError(res, err);
+  }
 });
 
-router.delete("/email/me/:id", async (req: Request, res: Response) => {
-  const tokens = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (tokens.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-
+router.delete(msgRoute(), async (req: Request, res: Response) => {
   const parsed = DeleteMessageParams.safeParse(req.params);
   if (!parsed.success) { res.status(400).json({ error: "Invalid params" }); return; }
 
-  const ok = await tryEachToken(tokens, (token, baseUrl) => graphDelete(token, baseUrl, `/me/messages/${parsed.data.id}`).then(() => true));
-  if (!ok) { res.status(404).json({ error: "Message not found" }); return; }
-  res.status(204).send();
+  try {
+    const tokens = await getAccessTokens(req, upnOf(req));
+    await tryEachToken(tokens, "deleteMessage", (token, baseUrl) =>
+      graphDelete(token, baseUrl, `/me/messages/${encodeURIComponent(parsed.data.id)}`).then(() => true)
+    );
+    res.status(204).send();
+  } catch (err) {
+    handleError(res, err);
+  }
 });
 
-router.patch("/email/me/:id/read", async (req: Request, res: Response) => {
-  const tokens = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (tokens.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-
+router.patch(msgRoute("/read"), async (req: Request, res: Response) => {
   const paramsParsed = MarkMessageReadParams.safeParse(req.params);
   const bodyParsed = MarkMessageReadBody.safeParse(req.body);
   if (!paramsParsed.success || !bodyParsed.success) { res.status(400).json({ error: "Invalid input" }); return; }
 
-  const result = await tryEachToken(tokens, (token, baseUrl) =>
-    graphPatch(token, baseUrl, `/me/messages/${paramsParsed.data.id}`, {
-      isRead: bodyParsed.data.isRead,
-    }) as Promise<Record<string, unknown>>
-  );
-  if (!result) { res.status(404).json({ error: "Message not found" }); return; }
-  res.json(mapMessage(result));
+  try {
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const result = await tryEachToken(tokens, "markRead", (token, baseUrl) =>
+      graphPatch(token, baseUrl, `/me/messages/${encodeURIComponent(paramsParsed.data.id)}`, {
+        isRead: bodyParsed.data.isRead,
+      }) as Promise<Record<string, unknown>>
+    );
+    res.json(mapMessage(result));
+  } catch (err) {
+    handleError(res, err);
+  }
 });
 
-router.post("/email/me/:id/move", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.post(msgRoute("/move"), async (req: Request, res: Response) => {
   const paramsParsed = MoveMessageParams.safeParse(req.params);
   const bodyParsed = MoveMessageBody.safeParse(req.body);
   if (!paramsParsed.success || !bodyParsed.success) { res.status(400).json({ error: "Invalid input" }); return; }
 
   try {
-    const data = await graphPost(token, baseUrl, `/me/messages/${paramsParsed.data.id}/move`, {
-      destinationId: bodyParsed.data.destinationFolderId,
-    }) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const data = await tryEachToken(tokens, "moveMessage", (token, baseUrl) =>
+      graphPost(token, baseUrl, `/me/messages/${encodeURIComponent(paramsParsed.data.id)}/move`, {
+        destinationId: bodyParsed.data.destinationFolderId,
+      }) as Promise<Record<string, unknown>>
+    );
     res.json(mapMessage(data));
   } catch (err) {
     handleError(res, err);
   }
 });
 
-router.post("/email/me/:id/reply", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.post(msgRoute("/reply"), async (req: Request, res: Response) => {
   const paramsParsed = ReplyToMessageParams.safeParse(req.params);
   const bodyParsed = ReplyToMessageBody.safeParse(req.body);
   if (!paramsParsed.success || !bodyParsed.success) { res.status(400).json({ error: "Invalid input" }); return; }
 
   try {
-    const draft = await graphPost(token, baseUrl, `/me/messages/${paramsParsed.data.id}/createReply`, {}) as Record<string, unknown>;
-    const draftId = draft?.id as string;
-    const updated = await graphPatch(token, baseUrl, `/me/messages/${draftId}`, {
-      body: { contentType: "html", content: bodyParsed.data.body },
-      ...(bodyParsed.data.toRecipients?.length
-        ? { toRecipients: bodyParsed.data.toRecipients.map((r) => ({ emailAddress: r })) }
-        : {}),
-    }) as Record<string, unknown>;
-    await graphPost(token, baseUrl, `/me/messages/${draftId}/send`, {});
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const updated = await tryEachToken(tokens, "reply", async (token, baseUrl) => {
+      const draft = await graphPost(token, baseUrl, `/me/messages/${encodeURIComponent(paramsParsed.data.id)}/createReply`, {}) as Record<string, unknown>;
+      const draftId = draft?.id as string;
+      const patched = await graphPatch(token, baseUrl, `/me/messages/${draftId}`, {
+        body: { contentType: "html", content: bodyParsed.data.body },
+        ...(bodyParsed.data.toRecipients?.length
+          ? { toRecipients: bodyParsed.data.toRecipients.map((r) => ({ emailAddress: r })) }
+          : {}),
+      }) as Record<string, unknown>;
+      await graphPost(token, baseUrl, `/me/messages/${draftId}/send`, {});
+      return patched;
+    });
     res.status(201).json(mapMessage(updated));
   } catch (err) {
     handleError(res, err);
   }
 });
 
-router.post("/email/me/:id/forward", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.post(msgRoute("/forward"), async (req: Request, res: Response) => {
   const paramsParsed = ForwardMessageParams.safeParse(req.params);
   const bodyParsed = ForwardMessageBody.safeParse(req.body);
   if (!paramsParsed.success || !bodyParsed.success) { res.status(400).json({ error: "Invalid input" }); return; }
 
   try {
-    const draft = await graphPost(token, baseUrl, `/me/messages/${paramsParsed.data.id}/createForward`, {}) as Record<string, unknown>;
-    const draftId = draft?.id as string;
-    await graphPatch(token, baseUrl, `/me/messages/${draftId}`, {
-      body: { contentType: "html", content: bodyParsed.data.body },
-      toRecipients: bodyParsed.data.toRecipients.map((r) => ({ emailAddress: r })),
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const draft = await tryEachToken(tokens, "forward", async (token, baseUrl) => {
+      const d = await graphPost(token, baseUrl, `/me/messages/${encodeURIComponent(paramsParsed.data.id)}/createForward`, {}) as Record<string, unknown>;
+      const draftId = d?.id as string;
+      await graphPatch(token, baseUrl, `/me/messages/${draftId}`, {
+        body: { contentType: "html", content: bodyParsed.data.body },
+        toRecipients: bodyParsed.data.toRecipients.map((r) => ({ emailAddress: r })),
+      });
+      await graphPost(token, baseUrl, `/me/messages/${draftId}/send`, {});
+      return d;
     });
-    await graphPost(token, baseUrl, `/me/messages/${draftId}/send`, {});
     res.status(201).json(mapMessage(draft));
   } catch (err) {
     handleError(res, err);
   }
 });
 
-router.post("/email/me/:id/archive", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.post(msgRoute("/archive"), async (req: Request, res: Response) => {
   const parsed = ArchiveMessageParams.safeParse(req.params);
   if (!parsed.success) { res.status(400).json({ error: "Invalid params" }); return; }
 
   try {
-    const data = await graphPost(token, baseUrl, `/me/messages/${parsed.data.id}/move`, {
-      destinationId: "archive",
-    }) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const data = await tryEachToken(tokens, "archive", (token, baseUrl) =>
+      graphPost(token, baseUrl, `/me/messages/${encodeURIComponent(parsed.data.id)}/move`, {
+        destinationId: "archive",
+      }) as Promise<Record<string, unknown>>
+    );
     res.json(mapMessage(data, "archive"));
   } catch (err) {
     handleError(res, err);
@@ -462,7 +504,8 @@ router.get("/email/stats", async (req: Request, res: Response) => {
               totalCount: (data.totalItemCount as number) ?? 0,
             };
           } catch (err) {
-            console.error(`[Graph] stats failed for folder=${folder}:`, (err as Error).message, (err as {body?:string}).body ?? "");
+            const e = err as UpstreamError;
+            console.error(`[Graph] stats failed for ${twb.user} folder=${folder}:`, e.status ?? "", e.message, (e.body ?? "").slice(0, 200));
             return { folder, displayName, unreadCount: 0, totalCount: 0 };
           }
         })
@@ -550,12 +593,7 @@ router.post("/email/analysis/mailbox", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/email/me/:id/ai-analysis", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.post(msgRoute("/ai-analysis"), async (req: Request, res: Response) => {
   const parsed = AnalyzeMessageParams.safeParse(req.params);
   if (!parsed.success) { res.status(400).json({ error: "Invalid params" }); return; }
 
@@ -577,9 +615,12 @@ router.post("/email/me/:id/ai-analysis", async (req: Request, res: Response) => 
   }
 
   try {
-    const msg = await graphGet(token, baseUrl, `/me/messages/${parsed.data.id}`, {
-      "$select": "id,subject,bodyPreview,body,from,receivedDateTime",
-    }) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const msg = await tryEachToken(tokens, "aiAnalysis", (token, baseUrl) =>
+      graphGet(token, baseUrl, `/me/messages/${encodeURIComponent(parsed.data.id)}`, {
+        "$select": "id,subject,bodyPreview,body,from,receivedDateTime",
+      }) as Promise<Record<string, unknown>>
+    );
 
     const bodyText = ((msg.body as Record<string, string> | null)?.content ?? "")
       .replace(/<[^>]*>/g, " ")
@@ -608,22 +649,23 @@ router.post("/email/me/:id/ai-analysis", async (req: Request, res: Response) => 
   }
 });
 
-router.get("/email/me/:id/attachments", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.get(msgRoute("/attachments"), async (req: Request, res: Response) => {
   const id = req.params.id as string;
   try {
-    const data = await graphGet(token, baseUrl, `/me/messages/${id}/attachments`, {
-      "$select": "id,name,contentType,size",
-    }) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const data = await tryEachToken(tokens, "listAttachments", (token, baseUrl) =>
+      graphGet(token, baseUrl, `/me/messages/${encodeURIComponent(id)}/attachments`, {
+        // contentId + isInline are required to resolve <img src="cid:..."> in the body.
+        "$select": "id,name,contentType,size,isInline,contentId",
+      }) as Promise<Record<string, unknown>>
+    );
     const attachments = (data.value as Array<Record<string, unknown>> ?? []).map((a) => ({
       id: a.id as string,
       name: (a.name as string) ?? "attachment",
       contentType: (a.contentType as string) ?? "application/octet-stream",
       size: (a.size as number) ?? 0,
+      isInline: (a.isInline as boolean) ?? false,
+      contentId: (a.contentId as string | null) ?? null,
     }));
     res.json({ attachments });
   } catch (err) {
@@ -631,15 +673,14 @@ router.get("/email/me/:id/attachments", async (req: Request, res: Response) => {
   }
 });
 
-router.get("/email/me/:id/attachments/:attachmentId", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.get(msgRoute("/attachments/:attachmentId"), async (req: Request, res: Response) => {
   const { id, attachmentId } = req.params as { id: string; attachmentId: string };
+  const inline = req.query.inline === "1";
   try {
-    const data = await graphGet(token, baseUrl, `/me/messages/${id}/attachments/${attachmentId}`) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const data = await tryEachToken(tokens, "getAttachment", (token, baseUrl) =>
+      graphGet(token, baseUrl, `/me/messages/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}`) as Promise<Record<string, unknown>>
+    );
     const contentBytes = data.contentBytes as string | null;
     const contentType = (data.contentType as string) ?? "application/octet-stream";
     const name = (data.name as string) ?? "attachment";
@@ -650,40 +691,39 @@ router.get("/email/me/:id/attachments/:attachmentId", async (req: Request, res: 
     }
 
     const buffer = Buffer.from(contentBytes, "base64");
+    // Inline images are only rendered as images; never let other types render inline.
+    const renderInline = inline && contentType.startsWith("image/");
     res.setHeader("Content-Type", contentType);
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+    res.setHeader(
+      "Content-Disposition",
+      `${renderInline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(name)}`,
+    );
     res.setHeader("Content-Length", String(buffer.length));
+    if (renderInline) res.setHeader("Cache-Control", "private, max-age=3600");
     res.send(buffer);
   } catch (err) {
     handleError(res, err);
   }
 });
 
-router.patch("/email/me/:id/flag", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.patch(msgRoute("/flag"), async (req: Request, res: Response) => {
   const id = req.params.id as string;
   const { flagged } = req.body as { flagged: boolean };
 
   try {
-    const data = await graphPatch(token, baseUrl, `/me/messages/${id}`, {
-      flag: { flagStatus: flagged ? "flagged" : "notFlagged" },
-    }) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const data = await tryEachToken(tokens, "flag", (token, baseUrl) =>
+      graphPatch(token, baseUrl, `/me/messages/${encodeURIComponent(id)}`, {
+        flag: { flagStatus: flagged ? "flagged" : "notFlagged" },
+      }) as Promise<Record<string, unknown>>
+    );
     res.json(mapMessage(data));
   } catch (err) {
     handleError(res, err);
   }
 });
 
-router.patch("/email/me/:id/importance", async (req: Request, res: Response) => {
-  const twb = await getAccessTokens(req, req.query.upn as string | undefined);
-  if (twb.length === 0) { res.status(401).json({ error: "No access token" }); return; }
-  const token = twb[0]!.token;
-  const baseUrl = twb[0]!.baseUrl;
-
+router.patch(msgRoute("/importance"), async (req: Request, res: Response) => {
   const id = req.params.id as string;
   const { importance } = req.body as { importance: "low" | "normal" | "high" };
   if (!["low", "normal", "high"].includes(importance)) {
@@ -692,7 +732,10 @@ router.patch("/email/me/:id/importance", async (req: Request, res: Response) => 
   }
 
   try {
-    const data = await graphPatch(token, baseUrl, `/me/messages/${id}`, { importance }) as Record<string, unknown>;
+    const tokens = await getAccessTokens(req, upnOf(req));
+    const data = await tryEachToken(tokens, "importance", (token, baseUrl) =>
+      graphPatch(token, baseUrl, `/me/messages/${encodeURIComponent(id)}`, { importance }) as Promise<Record<string, unknown>>
+    );
     res.json(mapMessage(data));
   } catch (err) {
     handleError(res, err);

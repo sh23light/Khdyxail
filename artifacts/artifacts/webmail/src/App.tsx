@@ -118,10 +118,18 @@ function Router() {
           <Redirect to="/inbox" />
         </Route>
         <Route path="/inbox">
-          <FolderPage folder="inbox" title="Inbox" />
+          <FolderPage key="unified-inbox" folder="inbox" title="Inbox" />
         </Route>
         <Route path="/inbox/:upn">
-          {(params) => <FolderPage folder="inbox" title={`${params.upn} - Inbox`} upn={params.upn} />}
+          {(params) => {
+            // Sidebar links use encodeURIComponent (e.g. live.com#user@outlook.com -> live.com%23...).
+            // Decode so the API receives the real mailbox name instead of a double-encoded one.
+            let upn = params.upn;
+            try { upn = decodeURIComponent(params.upn); } catch { /* already decoded */ }
+            // key: switching mailboxes must remount, otherwise the previously selected
+            // message (from another mailbox) is re-fetched against the new one and fails.
+            return <FolderPage key={upn} folder="inbox" title={`${upn} - Inbox`} upn={upn} />;
+          }}
         </Route>
         <Route path="/sent">
           <FolderPage folder="sentItems" title="Sent Items" />
