@@ -1,0 +1,642 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: Outlook Webmail API - proxy to Microsoft Graph API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: email
+    description: Email operations
+  - name: contacts
+    description: Contact operations
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /email/messages:
+    get:
+      operationId: listMessages
+      tags: [email]
+      summary: List messages in a folder
+      parameters:
+        - name: folder
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [inbox, sentItems, drafts, outbox, archive, deletedItems, junkemail]
+        - name: top
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: search
+          in: query
+          schema:
+            type: ["string", "null"]
+        - name: filter
+          in: query
+          schema:
+            type: ["string", "null"]
+      responses:
+        "200":
+          description: List of messages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageList"
+
+  /email/messages/{id}:
+    get:
+      operationId: getMessage
+      tags: [email]
+      summary: Get a specific message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Message detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+    delete:
+      operationId: deleteMessage
+      tags: [email]
+      summary: Delete a message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+
+  /email/messages/{id}/read:
+    patch:
+      operationId: markMessageRead
+      tags: [email]
+      summary: Mark message as read or unread
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MarkReadInput"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /email/messages/{id}/move:
+    post:
+      operationId: moveMessage
+      tags: [email]
+      summary: Move message to a folder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MoveInput"
+      responses:
+        "200":
+          description: Moved message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /email/messages/{id}/reply:
+    post:
+      operationId: replyToMessage
+      tags: [email]
+      summary: Reply to a message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplyInput"
+      responses:
+        "201":
+          description: Reply created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /email/messages/{id}/forward:
+    post:
+      operationId: forwardMessage
+      tags: [email]
+      summary: Forward a message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForwardInput"
+      responses:
+        "201":
+          description: Forwarded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /email/messages/{id}/archive:
+    post:
+      operationId: archiveMessage
+      tags: [email]
+      summary: Archive a message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Archived message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+
+  /email/send:
+    post:
+      operationId: sendEmail
+      tags: [email]
+      summary: Send a new email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmailInput"
+      responses:
+        "202":
+          description: Email sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendResult"
+
+  /email/conversations/{conversationId}:
+    get:
+      operationId: getConversation
+      tags: [email]
+      summary: Get all messages in a conversation
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Conversation messages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageList"
+
+  /email/search:
+    get:
+      operationId: searchMessages
+      tags: [email]
+      summary: Search across all folders
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: top
+          in: query
+          schema:
+            type: integer
+            default: 25
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageList"
+
+  /email/stats:
+    get:
+      operationId: getEmailStats
+      tags: [email]
+      summary: Get email folder stats (unread counts, totals)
+      responses:
+        "200":
+          description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmailStats"
+
+  /email/messages/{id}/ai-analysis:
+    post:
+      operationId: analyzeMessage
+      tags: [email]
+      summary: Run AI analysis on a message
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AiAnalysisRequest"
+      responses:
+        "200":
+          description: AI analysis result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAnalysis"
+
+  /contacts:
+    get:
+      operationId: listContacts
+      tags: [contacts]
+      summary: List contacts
+      parameters:
+        - name: search
+          in: query
+          schema:
+            type: ["string", "null"]
+        - name: top
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: List of contacts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContactList"
+    post:
+      operationId: createContact
+      tags: [contacts]
+      summary: Create a contact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContactInput"
+      responses:
+        "201":
+          description: Created contact
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Contact"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    EmailAddress:
+      type: object
+      properties:
+        name:
+          type: ["string", "null"]
+        address:
+          type: string
+      required:
+        - address
+
+    Message:
+      type: object
+      properties:
+        id:
+          type: string
+        subject:
+          type: ["string", "null"]
+        bodyPreview:
+          type: ["string", "null"]
+        body:
+          type: ["string", "null"]
+        isRead:
+          type: boolean
+        isDraft:
+          type: boolean
+        receivedDateTime:
+          type: ["string", "null"]
+        sentDateTime:
+          type: ["string", "null"]
+        from:
+          $ref: "#/components/schemas/EmailAddress"
+        toRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        ccRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        conversationId:
+          type: ["string", "null"]
+        hasAttachments:
+          type: boolean
+        importance:
+          type: string
+          enum: [low, normal, high]
+        folder:
+          type: ["string", "null"]
+      required:
+        - id
+        - isRead
+        - isDraft
+        - hasAttachments
+        - importance
+        - toRecipients
+        - ccRecipients
+        - from
+
+    MessageList:
+      type: object
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+        total:
+          type: integer
+        hasMore:
+          type: boolean
+      required:
+        - messages
+        - total
+        - hasMore
+
+    EmailInput:
+      type: object
+      properties:
+        subject:
+          type: string
+        body:
+          type: string
+        toRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        ccRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        bccRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        importance:
+          type: string
+          enum: [low, normal, high]
+          default: normal
+      required:
+        - subject
+        - body
+        - toRecipients
+
+    SendResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        messageId:
+          type: ["string", "null"]
+      required:
+        - success
+
+    MarkReadInput:
+      type: object
+      properties:
+        isRead:
+          type: boolean
+      required:
+        - isRead
+
+    MoveInput:
+      type: object
+      properties:
+        destinationFolderId:
+          type: string
+      required:
+        - destinationFolderId
+
+    ReplyInput:
+      type: object
+      properties:
+        body:
+          type: string
+        toRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+      required:
+        - body
+
+    ForwardInput:
+      type: object
+      properties:
+        body:
+          type: string
+        toRecipients:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+      required:
+        - body
+        - toRecipients
+
+    FolderStat:
+      type: object
+      properties:
+        folder:
+          type: string
+        displayName:
+          type: string
+        unreadCount:
+          type: integer
+        totalCount:
+          type: integer
+      required:
+        - folder
+        - displayName
+        - unreadCount
+        - totalCount
+
+    EmailStats:
+      type: object
+      properties:
+        folders:
+          type: array
+          items:
+            $ref: "#/components/schemas/FolderStat"
+        totalUnread:
+          type: integer
+      required:
+        - folders
+        - totalUnread
+
+    AiAnalysis:
+      type: object
+      properties:
+        summary:
+          type: string
+        sentiment:
+          type: string
+          enum: [positive, neutral, negative]
+        actionItems:
+          type: array
+          items:
+            type: string
+        suggestedReply:
+          type: ["string", "null"]
+        priority:
+          type: string
+          enum: [low, medium, high]
+        keyTopics:
+          type: array
+          items:
+            type: string
+      required:
+        - summary
+        - sentiment
+        - actionItems
+        - priority
+        - keyTopics
+
+    Contact:
+      type: object
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        emailAddresses:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        phone:
+          type: ["string", "null"]
+        company:
+          type: ["string", "null"]
+        jobTitle:
+          type: ["string", "null"]
+      required:
+        - id
+        - displayName
+        - emailAddresses
+
+    ContactList:
+      type: object
+      properties:
+        contacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Contact"
+        total:
+          type: integer
+      required:
+        - contacts
+        - total
+
+    ContactInput:
+      type: object
+      properties:
+        displayName:
+          type: string
+        emailAddresses:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailAddress"
+        phone:
+          type: ["string", "null"]
+        company:
+          type: ["string", "null"]
+        jobTitle:
+          type: ["string", "null"]
+      required:
+        - displayName
+        - emailAddresses
+
+    AiAnalysisRequest:
+      type: object
+      properties:
+        systemPrompt:
+          type: string
+          description: The system prompt that strictly controls AI behavior. Required — analysis is blocked without it.
+      required:
+        - systemPrompt

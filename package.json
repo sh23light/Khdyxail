@@ -1,0 +1,9 @@
+{
+  "name": "outlook-webmail",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "cd artifacts/artifacts/api-server && node --enable-source-maps dist/index.mjs",
+    "build": "cd artifacts/artifacts/api-server && pnpm run build"
+  }
+}
